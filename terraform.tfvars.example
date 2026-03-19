@@ -1,0 +1,41 @@
+# Example terraform.tfvars – adjust values for your environment
+#
+# Naming convention: <BU>-<MGMT>-<ENV>-<REG>-<RTYPE>-<APP/TIER>-<NNN>
+# Example result:    contoso-sec-prod-eus2-rg-sentinel-001
+
+# --- Naming components ---
+bu          = "contoso"
+mgmt        = "sec"
+env         = "prod"
+region_code = "eus2"
+app_tier    = "sentinel"
+instance    = "001"
+
+# --- Common ---
+location = "eastus2"
+tags = {
+  Environment  = "production"
+  Project      = "sentinel-data-lake"
+  ManagedBy    = "terraform"
+  BusinessUnit = "contoso"
+}
+
+# --- Log Analytics Workspace ---
+law_sku               = "PerGB2018"
+law_retention_in_days = 90
+law_daily_quota_gb    = -1
+
+# --- Sentinel ---
+sentinel_enable_fusion_alert_rule = true
+sentinel_enable_aad_connector     = true
+sentinel_enable_asc_connector     = true
+sentinel_enable_ti_connector      = true
+
+# sentinel_ms_security_incident_rules = {
+#   "defender_for_cloud" = {
+#     name            = "contoso-sec-prod-eus2-sar-mdc-001"
+#     display_name    = "Create incidents from Defender for Cloud"
+#     product_filter  = "Microsoft Defender for Cloud"
+#     severity_filter = ["High", "Medium"]
+#   }
+# }
