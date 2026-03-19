@@ -23,6 +23,12 @@ on:
       - '**.tfvars'
       - '.github/workflows/terraform-deploy.yml'
   workflow_dispatch:
+    inputs:
+      working_directory:
+        description: 'Terraform working directory (relative to repo root)'
+        required: false
+        default: '.'
+        type: string
 
 permissions:
   contents: write
@@ -35,6 +41,7 @@ concurrency:
 env:
   TF_VERSION: '~> 1.9'
   ARM_USE_OIDC: 'true'
+  WORKING_DIR: ${{ inputs.working_directory || '.' }}
 
 # =============================================================================
 jobs:
@@ -43,6 +50,9 @@ jobs:
   init:
     name: '🔧 Terraform Init'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,6 +72,15 @@ jobs:
       - name: Terraform Init (Upgrade)
         run: terraform init -upgrade -input=false
 
+      - name: Write Terraform Variables
+        env:
+          TF_VARS: ${{ secrets.TF_VARS }}
+        run: |
+          if [ -n "$TF_VARS" ]; then
+            echo "$TF_VARS" > terraform.auto.tfvars
+            echo "Wrote terraform.auto.tfvars from TF_VARS secret"
+          fi
+
       - name: Terraform Validate
         run: terraform validate -no-color
 
@@ -69,8 +88,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            .terraform
-            .terraform.lock.hcl
+            ${{ env.WORKING_DIR }}/.terraform
+            ${{ env.WORKING_DIR }}/.terraform.lock.hcl
           key: terraform-${{ github.run_id }}
 
   # ─── Stage 2 ── Terraform Plan ─────────────────────────────────────────────
@@ -78,6 +97,9 @@ jobs:
     name: '📋 Terraform Plan'
     needs: init
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,8 +114,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            .terraform
-            .terraform.lock.hcl
+            ${{ env.WORKING_DIR }}/.terraform
+            ${{ env.WORKING_DIR }}/.terraform.lock.hcl
           key: terraform-${{ github.run_id }}
           fail-on-cache-miss: true
 
@@ -152,14 +174,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
-          path: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
           retention-days: 5
 
       - name: Upload Plan (readable)
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-readable
-          path: tfplan-readable.txt
+          path: ${{ env.WORKING_DIR }}/tfplan-readable.txt
           retention-days: 30
 
   # ─── Stage 3 ── Approval Gate ──────────────────────────────────────────────
@@ -177,6 +199,9 @@ jobs:
     name: '🚀 Terraform Apply'
     needs: approve
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -191,8 +216,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            .terraform
-            .terraform.lock.hcl
+            ${{ env.WORKING_DIR }}/.terraform
+            ${{ env.WORKING_DIR }}/.terraform.lock.hcl
           key: terraform-${{ github.run_id }}
           fail-on-cache-miss: true
 
@@ -200,6 +225,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan
+          path: ${{ env.WORKING_DIR }}
 
       - name: Write Terraform Variables
         env:
