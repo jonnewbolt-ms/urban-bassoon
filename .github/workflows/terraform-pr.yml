@@ -1,0 +1,241 @@
+# =============================================================================
+#  Terraform PR Plan
+# =============================================================================
+#  Runs on every pull request that touches Terraform files.
+#  Validates formatting, initialises providers, produces a plan, and posts
+#  the results as a PR comment for review.
+# =============================================================================
+
+name: 'Terraform PR Plan'
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-pr.yml'
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: terraform-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true           # supersede stale plan runs
+
+env:
+  TF_VERSION: '~> 1.9'
+  ARM_USE_OIDC: 'true'
+
+# =============================================================================
+jobs:
+
+  # ─── Stage 1 ── Init & Validate ────────────────────────────────────────────
+  init:
+    name: '🔧 Init & Validate'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+        continue-on-error: true
+
+      - name: Terraform Init (Upgrade)
+        run: terraform init -upgrade -input=false
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Cache Terraform Working Directory
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .terraform
+            .terraform.lock.hcl
+          key: terraform-pr-${{ github.run_id }}
+
+    outputs:
+      fmt-outcome: ${{ steps.fmt.outcome }}
+
+  # ─── Stage 2 ── Plan ───────────────────────────────────────────────────────
+  plan:
+    name: '📋 Plan'
+    needs: init
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Restore Terraform Working Directory
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .terraform
+            .terraform.lock.hcl
+          key: terraform-pr-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Write Terraform Variables
+        env:
+          TF_VARS: ${{ secrets.TF_VARS }}
+        run: |
+          if [ -n "$TF_VARS" ]; then
+            echo "$TF_VARS" > terraform.auto.tfvars
+          fi
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -out=tfplan -input=false -no-color -detailed-exitcode 2>&1 | tee plan-output.txt
+          EXIT_CODE=$?
+          set -e
+
+          # Exit code 0 = no changes, 2 = changes present, 1 = error
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo "plan-status=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "plan-status=changes" >> "$GITHUB_OUTPUT"
+          else
+            echo "plan-status=no-changes" >> "$GITHUB_OUTPUT"
+          fi
+
+          terraform show -no-color tfplan > tfplan-readable.txt
+
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PLAN_STATUS: ${{ steps.plan.outputs.plan-status }}
+          FMT_OUTCOME: ${{ needs.init.outputs.fmt-outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Read plan output (use raw output if readable version unavailable)
+            let plan = '';
+            try {
+              plan = fs.readFileSync('tfplan-readable.txt', 'utf8');
+            } catch {
+              try {
+                plan = fs.readFileSync('plan-output.txt', 'utf8');
+              } catch {
+                plan = 'Plan output not available.';
+              }
+            }
+
+            const maxLen = 65000;
+            const body = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n... (truncated)'
+              : plan;
+
+            const statusMap = {
+              'changes':    '⚠️ Changes detected',
+              'no-changes': '✅ No changes',
+              'error':      '❌ Plan failed',
+            };
+            const status = statusMap[process.env.PLAN_STATUS] || '❓ Unknown';
+            const fmtIcon = process.env.FMT_OUTCOME === 'success' ? '✅' : '⚠️';
+
+            const commentBody = [
+              '<!-- terraform-plan -->',
+              `## 📋 Terraform Plan — ${status}`,
+              '',
+              `| Check | Status |`,
+              `|-------|--------|`,
+              `| Format | ${fmtIcon} \`terraform fmt\` |`,
+              `| Init   | ✅ \`terraform init -upgrade\` |`,
+              `| Validate | ✅ \`terraform validate\` |`,
+              `| Plan   | ${status} |`,
+              '',
+              '<details><summary>Show Plan Output</summary>',
+              '',
+              '```hcl',
+              body,
+              '```',
+              '',
+              '</details>',
+              '',
+              `*Workflow: [Run #${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`,
+            ].join('\n');
+
+            // Update existing bot comment or create a new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('<!-- terraform-plan -->')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }
+
+      - name: Plan Summary
+        if: always()
+        run: |
+          {
+            echo '## 📋 Terraform Plan'
+            echo ''
+            if [ -f tfplan-readable.txt ]; then
+              echo '<details><summary>Show Plan</summary>'
+              echo ''
+              echo '```hcl'
+              head -c 65000 tfplan-readable.txt
+              echo ''
+              echo '```'
+              echo ''
+              echo '</details>'
+            else
+              echo '> Plan output not available — see logs for details.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
